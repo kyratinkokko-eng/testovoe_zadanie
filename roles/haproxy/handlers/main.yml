@@ -1,10 +1,6 @@
 ---
 # ============================================================
-#  Handlers: graceful reload HAProxy без разрыва соединений
-#
-#  Цепочка: Reload HAProxy → Validate config → Send SIGUSR2
-#  Если валидация не проходит — reload не выполняется,
-#  старый конфиг остаётся в работе.
+#  Handlers: graceful reload HAProxy + systemd persistence
 # ============================================================
 
 - name: Reload HAProxy
@@ -18,3 +14,10 @@
   ansible.builtin.command:
     cmd: docker kill --signal=USR2 haproxy
   when: haproxy_validate.rc == 0
+
+- name: Enable tproxy-routing service
+  ansible.builtin.systemd:
+    name: tproxy-routing
+    enabled: true
+    daemon_reload: true
+    state: started

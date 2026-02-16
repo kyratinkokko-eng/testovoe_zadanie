@@ -6,6 +6,7 @@
 
 # -----------------------------------------------------------
 #  1. Sysctl: разрешить биндинг на нелокальные IP (TPROXY)
+#     Персистентно через /etc/sysctl.d/
 # -----------------------------------------------------------
 - name: "Sysctl: enable ip_nonlocal_bind for TPROXY"
   ansible.posix.sysctl:
@@ -24,8 +25,7 @@
     reload: true
 
 # -----------------------------------------------------------
-#  2. TPROXY: ip rule + ip route для маршрутизации
-#     обратных пакетов через loopback
+#  2. TPROXY: ip rule + ip route (runtime)
 # -----------------------------------------------------------
 - name: "TPROXY: add ip rule fwmark 1 lookup 100"
   ansible.builtin.command:
@@ -42,8 +42,33 @@
   failed_when: ip_route_result.rc != 0 and 'File exists' not in ip_route_result.stderr
 
 # -----------------------------------------------------------
-#  3. TPROXY: iptables mangle rules — маркировка обратного
-#     трафика от каждого MTProxy-порта
+#  2b. Персистентность ip rule / ip route после ребута
+#      через systemd oneshot unit
+# -----------------------------------------------------------
+- name: "TPROXY: deploy systemd unit for persistent routing"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tproxy-routing.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=TPROXY routing rules for HAProxy transparent proxy
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/sh -c '/sbin/ip rule add fwmark 1 lookup 100 2>/dev/null || true'
+      ExecStart=/bin/sh -c '/sbin/ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true'
+      ExecStop=/sbin/ip rule del fwmark 1 lookup 100
+      ExecStop=/sbin/ip route del local 0.0.0.0/0 dev lo table 100
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Enable tproxy-routing service
+
+# -----------------------------------------------------------
+#  3. TPROXY: iptables mangle rules (runtime, idempotent)
 # -----------------------------------------------------------
 - name: "TPROXY: mark return traffic from MTProxy ports (iptables mangle OUTPUT)"
   ansible.builtin.shell: |
@@ -54,6 +79,20 @@
     label: "port {{ mtproxy_base_port + item - 1 }}"
   register: iptables_result
   changed_when: "'already' not in iptables_result.stderr"
+
+# -----------------------------------------------------------
+#  3b. Персистентность iptables через iptables-persistent
+# -----------------------------------------------------------
+- name: Install iptables-persistent for rule persistence
+  ansible.builtin.apt:
+    name: iptables-persistent
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Save iptables rules for persistence across reboots
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: true
 
 # -----------------------------------------------------------
 #  4. Создать каталог и отрендерить конфиг HAProxy
@@ -78,7 +117,6 @@
   community.docker.docker_image:
     name: "{{ haproxy_image }}"
     source: pull
-    force_source: true
 
 - name: Run HAProxy container (host network + TPROXY capabilities)
   community.docker.docker_container:

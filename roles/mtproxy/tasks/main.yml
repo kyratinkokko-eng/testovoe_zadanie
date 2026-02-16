@@ -7,7 +7,6 @@
   community.docker.docker_image:
     name: "{{ mtproxy_image }}"
     source: pull
-    force_source: true
 
 - name: Create MTProxy run script directory
   ansible.builtin.file:
@@ -20,6 +19,7 @@
     src: run.sh.j2
     dest: /opt/mtproxy/run.sh
     mode: "0755"
+  notify: Restart MTProxy containers
 
 - name: Create MTProxy containers
   community.docker.docker_container:
@@ -36,7 +36,6 @@
     volumes:
       - "mtproxy_data_{{ item }}:/data"
       - "/opt/mtproxy/run.sh:/run.sh:ro"
-    recreate: true
   loop: "{{ range(1, mtproxy_replicas + 1) | list }}"
   loop_control:
     label: "mtproxy_{{ item }} → port {{ mtproxy_base_port + item - 1 }}"

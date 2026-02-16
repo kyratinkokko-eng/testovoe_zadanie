@@ -13,6 +13,8 @@ mtproxy_base_port: 4431                                # порты: 4431, 4432,
 haproxy_image: "haproxy:2.9-alpine"
 haproxy_frontend_port: 8443        # единая точка входа для Telegram-клиентов
 haproxy_stats_port: 8404           # HAProxy stats dashboard (http)
+haproxy_stats_user: admin          # логин для stats dashboard
+haproxy_stats_password: "Ch4ng3M3!"  # пароль для stats — сменить перед продом
 haproxy_balance: leastconn         # или roundrobin
 
 # ===========================================================

@@ -44,3 +44,5 @@ listen stats
     stats uri /stats
     stats refresh 5s
     stats show-legends
+    stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+    stats admin if TRUE
