@@ -1,0 +1,8 @@
+---
+mtproxy_replicas: 2
+mtproxy_secret: "00000000000000000000000000000000"
+mtproxy_image: "telegrammessenger/proxy:latest"
+mtproxy_base_port: 4431
+
+# Верхний предел для cleanup (scale-down): удалять контейнеры до этого индекса
+mtproxy_max_cleanup_index: 10

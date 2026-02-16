@@ -1,0 +1,37 @@
+---
+# ============================================================
+#  Active-Active MTProxy с HAProxy балансировкой и failover
+#
+#  Использование:
+#    ansible-galaxy collection install -r requirements.yml
+#    ansible-playbook -i inventory/hosts.yml playbooks/site.yml
+#
+#  Масштабирование:
+#    Изменить mtproxy_replicas в inventory/group_vars/all.yml
+#    и перезапустить playbook — HAProxy конфиг обновится
+#    автоматически с graceful reload.
+# ============================================================
+
+- name: Deploy MTProxy Active-Active with HAProxy (TPROXY)
+  hosts: mtproxy_servers
+  become: true
+
+  pre_tasks:
+    - name: Verify target OS is Debian/Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "Debian"
+        fail_msg: "This playbook supports Debian/Ubuntu only. Detected: {{ ansible_facts['os_family'] }}"
+
+    - name: Remove broken apt repositories (bullseye-backports, etc.)
+      ansible.builtin.file:
+        path: "/etc/apt/sources.list.d/{{ item }}"
+        state: absent
+      loop:
+        - backports.list
+      ignore_errors: true
+
+  roles:
+    - docker
+    - mtproxy
+    - haproxy

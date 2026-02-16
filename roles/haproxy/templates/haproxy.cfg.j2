@@ -1,0 +1,46 @@
+# ============================================================
+#  HAProxy — Active-Active MTProxy Load Balancer
+#  Режим: TCP + TPROXY (transparent proxy, сохранение IP клиента)
+#  Сгенерировано Ansible — не редактировать вручную
+# ============================================================
+
+global
+    log stdout format raw local0
+    maxconn 4096
+
+defaults
+    mode    tcp
+    log     global
+    option  tcplog
+    option  tcp-check
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+
+# -----------------------------------------------------------
+#  Frontend: единая точка входа для Telegram-клиентов
+# -----------------------------------------------------------
+frontend mtproxy_front
+    bind *:{{ haproxy_frontend_port }}
+    default_backend mtproxy_back
+
+# -----------------------------------------------------------
+#  Backend: MTProxy инстансы с TPROXY (сохранение IP клиента)
+# -----------------------------------------------------------
+backend mtproxy_back
+    balance {{ haproxy_balance }}
+    source 0.0.0.0 usesrc clientip
+{% for i in range(1, mtproxy_replicas + 1) %}
+    server mtproxy_{{ i }} 127.0.0.1:{{ mtproxy_base_port + i - 1 }} check inter 3s fall 2 rise 2
+{% endfor %}
+
+# -----------------------------------------------------------
+#  Stats: мониторинг и проверка состояния бэкендов
+# -----------------------------------------------------------
+listen stats
+    bind *:{{ haproxy_stats_port }}
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 5s
+    stats show-legends

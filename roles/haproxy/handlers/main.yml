@@ -1,0 +1,20 @@
+---
+# ============================================================
+#  Handlers: graceful reload HAProxy без разрыва соединений
+#
+#  Цепочка: Reload HAProxy → Validate config → Send SIGUSR2
+#  Если валидация не проходит — reload не выполняется,
+#  старый конфиг остаётся в работе.
+# ============================================================
+
+- name: Reload HAProxy
+  ansible.builtin.command:
+    cmd: docker exec haproxy haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+  register: haproxy_validate
+  changed_when: haproxy_validate.rc == 0
+  notify: Send SIGUSR2 to HAProxy
+
+- name: Send SIGUSR2 to HAProxy
+  ansible.builtin.command:
+    cmd: docker kill --signal=USR2 haproxy
+  when: haproxy_validate.rc == 0

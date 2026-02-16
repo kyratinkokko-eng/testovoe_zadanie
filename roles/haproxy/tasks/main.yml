@@ -1,0 +1,95 @@
+---
+# ============================================================
+#  Роль: haproxy — TPROXY-настройка хоста, деплой конфига,
+#  запуск контейнера HAProxy в master-worker режиме
+# ============================================================
+
+# -----------------------------------------------------------
+#  1. Sysctl: разрешить биндинг на нелокальные IP (TPROXY)
+# -----------------------------------------------------------
+- name: "Sysctl: enable ip_nonlocal_bind for TPROXY"
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_nonlocal_bind
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+
+- name: "Sysctl: enable ip_forward"
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+
+# -----------------------------------------------------------
+#  2. TPROXY: ip rule + ip route для маршрутизации
+#     обратных пакетов через loopback
+# -----------------------------------------------------------
+- name: "TPROXY: add ip rule fwmark 1 lookup 100"
+  ansible.builtin.command:
+    cmd: ip rule add fwmark 1 lookup 100
+  register: ip_rule_result
+  changed_when: ip_rule_result.rc == 0
+  failed_when: ip_rule_result.rc != 0 and 'File exists' not in ip_rule_result.stderr
+
+- name: "TPROXY: add local route in table 100"
+  ansible.builtin.command:
+    cmd: ip route add local 0.0.0.0/0 dev lo table 100
+  register: ip_route_result
+  changed_when: ip_route_result.rc == 0
+  failed_when: ip_route_result.rc != 0 and 'File exists' not in ip_route_result.stderr
+
+# -----------------------------------------------------------
+#  3. TPROXY: iptables mangle rules — маркировка обратного
+#     трафика от каждого MTProxy-порта
+# -----------------------------------------------------------
+- name: "TPROXY: mark return traffic from MTProxy ports (iptables mangle OUTPUT)"
+  ansible.builtin.shell: |
+    iptables -t mangle -C OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1
+  loop: "{{ range(1, mtproxy_replicas + 1) | list }}"
+  loop_control:
+    label: "port {{ mtproxy_base_port + item - 1 }}"
+  register: iptables_result
+  changed_when: "'already' not in iptables_result.stderr"
+
+# -----------------------------------------------------------
+#  4. Создать каталог и отрендерить конфиг HAProxy
+# -----------------------------------------------------------
+- name: Create HAProxy config directory
+  ansible.builtin.file:
+    path: "{{ haproxy_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Render HAProxy configuration from template
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: "{{ haproxy_config_path }}"
+    mode: "0644"
+  notify: Reload HAProxy
+
+# -----------------------------------------------------------
+#  5. Pull и запуск контейнера HAProxy
+# -----------------------------------------------------------
+- name: Pull HAProxy image
+  community.docker.docker_image:
+    name: "{{ haproxy_image }}"
+    source: pull
+    force_source: true
+
+- name: Run HAProxy container (host network + TPROXY capabilities)
+  community.docker.docker_container:
+    name: haproxy
+    image: "{{ haproxy_image }}"
+    state: started
+    restart_policy: unless-stopped
+    network_mode: host
+    capabilities:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - "{{ haproxy_config_path }}:/usr/local/etc/haproxy/haproxy.cfg:ro"
+    command: "haproxy -W -f /usr/local/etc/haproxy/haproxy.cfg"

@@ -1,0 +1,22 @@
+---
+# ===========================================================
+#  MTProxy — количество реплик и образ
+# ===========================================================
+mtproxy_replicas: 2
+mtproxy_secret: "b3b34e89c9471207ad107a03b565e9a3"   # 32 hex символа (образ сам добавит dd-префикс)
+mtproxy_image: "telegrammessenger/proxy:latest"
+mtproxy_base_port: 4431                                # порты: 4431, 4432, ...
+
+# ===========================================================
+#  HAProxy — балансировка и статистика
+# ===========================================================
+haproxy_image: "haproxy:2.9-alpine"
+haproxy_frontend_port: 8443        # единая точка входа для Telegram-клиентов
+haproxy_stats_port: 8404           # HAProxy stats dashboard (http)
+haproxy_balance: leastconn         # или roundrobin
+
+# ===========================================================
+#  Путь к конфигу HAProxy на хосте
+# ===========================================================
+haproxy_config_dir: /etc/haproxy
+haproxy_config_path: "{{ haproxy_config_dir }}/haproxy.cfg"

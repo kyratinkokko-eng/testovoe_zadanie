@@ -1,0 +1,11 @@
+---
+haproxy_image: "haproxy:2.9-alpine"
+haproxy_frontend_port: 8443
+haproxy_stats_port: 8404
+haproxy_balance: leastconn
+
+haproxy_config_dir: /etc/haproxy
+haproxy_config_path: "{{ haproxy_config_dir }}/haproxy.cfg"
+
+mtproxy_replicas: 2
+mtproxy_base_port: 4431

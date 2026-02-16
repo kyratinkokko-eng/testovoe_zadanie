@@ -1,0 +1,9 @@
+---
+- name: Restart MTProxy containers
+  community.docker.docker_container:
+    name: "mtproxy_{{ item }}"
+    state: started
+    restart: true
+  loop: "{{ range(1, mtproxy_replicas + 1) | list }}"
+  loop_control:
+    label: "mtproxy_{{ item }}"
