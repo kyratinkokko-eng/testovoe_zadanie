@@ -27,6 +27,11 @@
 # -----------------------------------------------------------
 #  2. TPROXY: ip rule + ip route (runtime)
 # -----------------------------------------------------------
+- name: "TPROXY: clean up duplicate ip rules"
+  ansible.builtin.shell: |
+    while ip rule del fwmark 1 lookup 100 2>/dev/null; do :; done
+  changed_when: false
+
 - name: "TPROXY: add ip rule fwmark 1 lookup 100"
   ansible.builtin.command:
     cmd: ip rule add fwmark 1 lookup 100
@@ -125,6 +130,7 @@
     state: started
     restart_policy: unless-stopped
     network_mode: host
+    user: "root:root"
     capabilities:
       - NET_ADMIN
       - NET_RAW

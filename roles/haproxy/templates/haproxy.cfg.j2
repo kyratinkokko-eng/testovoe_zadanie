@@ -1,6 +1,7 @@
 # ============================================================
 #  HAProxy — Active-Active MTProxy Load Balancer
-#  Режим: TCP + TPROXY (transparent proxy, сохранение IP клиента)
+#  Режим: TCP с балансировкой и активными health checks
+#  TPROXY (usesrc clientip) опционален — см. haproxy_tproxy
 #  Сгенерировано Ansible — не редактировать вручную
 # ============================================================
 
@@ -25,11 +26,16 @@ frontend mtproxy_front
     default_backend mtproxy_back
 
 # -----------------------------------------------------------
-#  Backend: MTProxy инстансы с TPROXY (сохранение IP клиента)
+#  Backend: MTProxy инстансы
+#  TPROXY (source 0.0.0.0 usesrc clientip) включается
+#  переменной haproxy_tproxy: true — требует HAProxy и бэкенды
+#  на РАЗНЫХ хостах или в разных network namespace
 # -----------------------------------------------------------
 backend mtproxy_back
     balance {{ haproxy_balance }}
+{% if haproxy_tproxy | default(false) | bool %}
     source 0.0.0.0 usesrc clientip
+{% endif %}
 {% for i in range(1, mtproxy_replicas + 1) %}
     server mtproxy_{{ i }} 127.0.0.1:{{ mtproxy_base_port + i - 1 }} check inter 3s fall 2 rise 2
 {% endfor %}

@@ -16,6 +16,7 @@ haproxy_stats_port: 8404           # HAProxy stats dashboard (http)
 haproxy_stats_user: admin          # логин для stats dashboard
 haproxy_stats_password: "Ch4ng3M3!"  # пароль для stats — сменить перед продом
 haproxy_balance: leastconn         # или roundrobin
+haproxy_tproxy: false              # true = TPROXY (usesrc clientip), требует разные хосты
 
 # ===========================================================
 #  Путь к конфигу HAProxy на хосте
