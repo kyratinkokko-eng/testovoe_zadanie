@@ -1,0 +1,5 @@
+---
+dashboard_port: 8080
+dashboard_user: admin
+dashboard_password: "Ch4ng3M3!"
+

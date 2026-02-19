@@ -26,10 +26,7 @@ frontend mtproxy_front
     default_backend mtproxy_back
 
 # -----------------------------------------------------------
-#  Backend: MTProxy инстансы
-#  TPROXY (source 0.0.0.0 usesrc clientip) включается
-#  переменной haproxy_tproxy: true — требует HAProxy и бэкенды
-#  на РАЗНЫХ хостах или в разных network namespace
+#  Backend: MTProxy инстансы (через WireGuard при multi-host)
 # -----------------------------------------------------------
 backend mtproxy_back
     balance {{ haproxy_balance }}
@@ -37,7 +34,7 @@ backend mtproxy_back
     source 0.0.0.0 usesrc clientip
 {% endif %}
 {% for i in range(1, mtproxy_replicas + 1) %}
-    server mtproxy_{{ i }} 127.0.0.1:{{ mtproxy_base_port + i - 1 }} check inter 3s fall 2 rise 2
+    server mtproxy_{{ i }} {{ mtproxy_backend_ip | default('127.0.0.1') }}:{{ mtproxy_base_port + i - 1 }} check inter 3s fall 2 rise 2
 {% endfor %}
 
 # -----------------------------------------------------------

@@ -1,0 +1,51 @@
+---
+# ============================================================
+#  Роль: mtproxy_dashboard — веб-панель активных соединений
+# ============================================================
+
+- name: Install conntrack-tools for connection tracking
+  ansible.builtin.apt:
+    name: conntrack
+    state: present
+
+- name: Create dashboard directory
+  ansible.builtin.file:
+    path: /opt/mtproxy-dashboard
+    state: directory
+    mode: "0755"
+
+- name: Deploy dashboard script
+  ansible.builtin.template:
+    src: dashboard.py.j2
+    dest: /opt/mtproxy-dashboard/dashboard.py
+    mode: "0755"
+  notify: Restart mtproxy-dashboard
+
+- name: Deploy systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mtproxy-dashboard.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=MTProxy Connections Dashboard
+      After=network-online.target docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/bin/python3 /opt/mtproxy-dashboard/dashboard.py
+      Restart=always
+      RestartSec=5
+      Environment=PYTHONUNBUFFERED=1
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart mtproxy-dashboard
+
+- name: Enable and start dashboard service
+  ansible.builtin.systemd:
+    name: mtproxy-dashboard
+    enabled: true
+    state: started
+    daemon_reload: true
+

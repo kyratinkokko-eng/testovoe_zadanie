@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+MTProxy Connections Dashboard
+Показывает активные клиентские соединения к MTProxy.
+Без внешних зависимостей — только stdlib Python 3.
+"""
+
+import http.server
+import subprocess
+import json
+import base64
+import re
+import time
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs
+
+LISTEN_PORT = {{ dashboard_port }}
+USERNAME = "{{ dashboard_user }}"
+PASSWORD = "{{ dashboard_password }}"
+MTPROXY_PORTS = [{{ mtproxy_base_port }} + i for i in range({{ mtproxy_replicas }})]
+WG_INTERFACE = "wg0"
+
+MSK = timezone(timedelta(hours=3))
+
+
+def check_auth(headers):
+    """Basic HTTP Authentication."""
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode()
+        user, pwd = decoded.split(":", 1)
+        return user == USERNAME and pwd == PASSWORD
+    except Exception:
+        return False
+
+
+def get_ss_connections():
+    """Получить активные TCP-соединения через ss."""
+    connections = []
+    sport_filter = " or ".join(f"sport = :{p}" for p in MTPROXY_PORTS)
+    cmd = f"ss -tn state established '( {sport_filter} )'"
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split("\n")[1:]:  # skip header
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            # ss -tn state established выводит: Recv-Q Send-Q Local Peer
+            # (без колонки State, т.к. state уже задан в фильтре)
+            local = parts[2]   # 10.8.0.2:4431
+            peer = parts[3]    # client_ip:client_port
+
+            local_ip, local_port = local.rsplit(":", 1)
+            peer_ip, peer_port = peer.rsplit(":", 1)
+
+            connections.append({
+                "client_ip": peer_ip,
+                "client_port": peer_port,
+                "tunnel_ip": local_ip,
+                "mtproxy_port": local_port,
+            })
+    except Exception as e:
+        connections.append({"error": str(e)})
+    return connections
+
+
+def get_conntrack_connections():
+    """Получить соединения через conntrack (дополнительная информация)."""
+    connections = []
+    for port in MTPROXY_PORTS:
+        cmd = f"conntrack -L -p tcp --dport {port} 2>/dev/null"
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                src_match = re.search(r'src=(\S+)', line)
+                dst_match = re.search(r'dst=(\S+)', line)
+                sport_match = re.search(r'sport=(\d+)', line)
+                dport_match = re.search(r'dport=(\d+)', line)
+                state_match = re.search(r'(ESTABLISHED|SYN_SENT|TIME_WAIT|CLOSE_WAIT|FIN_WAIT)', line)
+                if src_match and dst_match:
+                    connections.append({
+                        "src": src_match.group(1),
+                        "dst": dst_match.group(1),
+                        "sport": sport_match.group(1) if sport_match else "-",
+                        "dport": dport_match.group(1) if dport_match else str(port),
+                        "state": state_match.group(1) if state_match else "UNKNOWN",
+                    })
+        except Exception:
+            pass
+    return connections
+
+
+def get_docker_status():
+    """Статус Docker-контейнеров MTProxy."""
+    containers = []
+    cmd = "docker ps --format '{% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}' --filter name=mtproxy"
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            containers.append({
+                "name": parts[0] if len(parts) > 0 else "-",
+                "status": parts[1] if len(parts) > 1 else "-",
+                "ports": parts[2] if len(parts) > 2 else "-",
+            })
+    except Exception as e:
+        containers.append({"name": "error", "status": str(e), "ports": "-"})
+    return containers
+
+
+def get_wg_status():
+    """Статус WireGuard интерфейса."""
+    try:
+        result = subprocess.run(["wg", "show", WG_INTERFACE], capture_output=True, text=True, timeout=5)
+        return result.stdout.strip()
+    except Exception as e:
+        return str(e)
+
+
+def render_html(connections, docker_status, wg_status):
+    now = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+    total = len(connections)
+
+    # Count unique client IPs
+    unique_ips = set()
+    for c in connections:
+        if "client_ip" in c:
+            unique_ips.add(c["client_ip"])
+
+    rows = ""
+    for i, c in enumerate(connections, 1):
+        if "error" in c:
+            rows += f'<tr><td colspan="5" class="error">{c["error"]}</td></tr>'
+            continue
+
+        # Determine MTProxy instance name
+        try:
+            port_num = int(c["mtproxy_port"])
+            instance_idx = port_num - {{ mtproxy_base_port }} + 1
+            instance_name = f"mtproxy_{instance_idx}"
+        except (ValueError, KeyError):
+            instance_name = "-"
+
+        rows += f"""<tr>
+            <td class="num">{i}</td>
+            <td class="ip"><span class="badge badge-client">{c['client_ip']}</span></td>
+            <td class="port">{c['client_port']}</td>
+            <td class="ip"><span class="badge badge-tunnel">{c['tunnel_ip']}</span></td>
+            <td class="port">{c['mtproxy_port']} <span class="instance">({instance_name})</span></td>
+        </tr>"""
+
+    if not connections:
+        rows = '<tr><td colspan="5" class="empty">Нет активных соединений</td></tr>'
+
+    docker_rows = ""
+    for d in docker_status:
+        status_class = "up" if "Up" in d.get("status", "") else "down"
+        docker_rows += f"""<tr>
+            <td><span class="badge badge-docker">{d['name']}</span></td>
+            <td class="status-{status_class}">{d['status']}</td>
+            <td>{d['ports']}</td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="5">
+    <title>MTProxy Dashboard</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 24px;
+        }}
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .header h1 {{
+            font-size: 24px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }}
+        .header h1 span {{ color: #38bdf8; }}
+        .header .meta {{
+            font-size: 13px;
+            color: #64748b;
+            text-align: right;
+        }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .stat-card {{
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+        }}
+        .stat-card .label {{
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            margin-bottom: 4px;
+        }}
+        .stat-card .value {{
+            font-size: 32px;
+            font-weight: 700;
+            color: #f1f5f9;
+        }}
+        .stat-card .value.green {{ color: #4ade80; }}
+        .stat-card .value.blue {{ color: #38bdf8; }}
+        .stat-card .value.purple {{ color: #a78bfa; }}
+
+        .section {{
+            margin-bottom: 24px;
+        }}
+        .section h2 {{
+            font-size: 16px;
+            font-weight: 600;
+            color: #94a3b8;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .section h2::before {{
+            content: '';
+            display: inline-block;
+            width: 4px;
+            height: 18px;
+            background: #38bdf8;
+            border-radius: 2px;
+        }}
+
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            background: #1e293b;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #334155;
+        }}
+        thead th {{
+            background: #0f172a;
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            border-bottom: 1px solid #334155;
+        }}
+        tbody td {{
+            padding: 10px 16px;
+            font-size: 14px;
+            border-bottom: 1px solid #1e293b;
+        }}
+        tbody tr:hover {{
+            background: #334155;
+        }}
+        tbody tr:last-child td {{ border-bottom: none; }}
+
+        .num {{ color: #475569; font-size: 12px; width: 40px; }}
+        .ip {{ font-family: 'SF Mono', 'Fira Code', monospace; }}
+        .port {{ font-family: 'SF Mono', 'Fira Code', monospace; color: #94a3b8; }}
+        .instance {{ font-size: 11px; color: #64748b; }}
+
+        .badge {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+        }}
+        .badge-client {{
+            background: rgba(74, 222, 128, 0.1);
+            color: #4ade80;
+            border: 1px solid rgba(74, 222, 128, 0.2);
+        }}
+        .badge-tunnel {{
+            background: rgba(56, 189, 248, 0.1);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.2);
+        }}
+        .badge-docker {{
+            background: rgba(167, 139, 250, 0.1);
+            color: #a78bfa;
+            border: 1px solid rgba(167, 139, 250, 0.2);
+        }}
+
+        .status-up {{ color: #4ade80; font-weight: 500; }}
+        .status-down {{ color: #f87171; font-weight: 500; }}
+
+        .empty {{
+            text-align: center;
+            color: #475569;
+            padding: 40px !important;
+            font-style: italic;
+        }}
+        .error {{
+            color: #f87171;
+            text-align: center;
+        }}
+
+        .wg-status {{
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #334155;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            color: #94a3b8;
+            max-height: 200px;
+            overflow-y: auto;
+        }}
+
+        .footer {{
+            margin-top: 32px;
+            text-align: center;
+            font-size: 12px;
+            color: #334155;
+        }}
+
+        .api-hint {{
+            margin-top: 8px;
+            font-size: 12px;
+            color: #475569;
+        }}
+        .api-hint code {{
+            background: #1e293b;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+        }}
+
+        @media (max-width: 768px) {{
+            body {{ padding: 12px; }}
+            .header {{ flex-direction: column; align-items: flex-start; gap: 8px; }}
+            .stats {{ grid-template-columns: repeat(2, 1fr); }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔌 <span>MTProxy</span> Dashboard</h1>
+        <div class="meta">
+            Обновлено: {now}<br>
+            Авто-обновление: 5 сек
+        </div>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card">
+            <div class="label">Активные соединения</div>
+            <div class="value green">{total}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Уникальные клиенты</div>
+            <div class="value blue">{len(unique_ips)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">MTProxy инстансы</div>
+            <div class="value purple">{len(docker_status)}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Порты MTProxy</div>
+            <div class="value">{', '.join(str(p) for p in MTPROXY_PORTS)}</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Клиентские соединения</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Клиентский IP (белый)</th>
+                    <th>Клиентский порт</th>
+                    <th>IP туннеля (WireGuard)</th>
+                    <th>Порт MTProxy</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+        <div class="api-hint">JSON API: <code>GET /api/connections</code></div>
+    </div>
+
+    <div class="section">
+        <h2>Docker-контейнеры</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Контейнер</th>
+                    <th>Статус</th>
+                    <th>Порты</th>
+                </tr>
+            </thead>
+            <tbody>
+                {docker_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section">
+        <h2>WireGuard Status</h2>
+        <div class="wg-status">{wg_status}</div>
+    </div>
+
+    <div class="footer">
+        MTProxy Dashboard • Backend {', '.join(str(p) for p in MTPROXY_PORTS)} • WireGuard {WG_INTERFACE}
+    </div>
+</body>
+</html>"""
+
+
+class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress default logging
+
+    def send_auth_required(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="MTProxy Dashboard"')
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"<h1>401 Unauthorized</h1>")
+
+    def do_GET(self):
+        if not check_auth(self.headers):
+            self.send_auth_required()
+            return
+
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/api/connections":
+            connections = get_ss_connections()
+            data = json.dumps(connections, ensure_ascii=False, indent=2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data.encode())
+            return
+
+        if parsed.path == "/api/docker":
+            docker_status = get_docker_status()
+            data = json.dumps(docker_status, ensure_ascii=False, indent=2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data.encode())
+            return
+
+        # Main dashboard
+        connections = get_ss_connections()
+        docker_status = get_docker_status()
+        wg_status = get_wg_status()
+        html = render_html(connections, docker_status, wg_status)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("0.0.0.0", LISTEN_PORT), DashboardHandler)
+    print(f"[*] MTProxy Dashboard running on http://0.0.0.0:{LISTEN_PORT}")
+    print(f"[*] Monitoring ports: {MTPROXY_PORTS}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down.")
+        server.server_close()
+

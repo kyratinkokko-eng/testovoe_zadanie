@@ -1,110 +1,140 @@
-# Active-Active MTProxy + HAProxy + Ansible
+# MTProxy + HAProxy TPROXY + WireGuard — Ansible
 
-Ansible-проект для развёртывания отказоустойчивого кластера Telegram MTProxy с балансировкой нагрузки через HAProxy (TCP mode, опциональный TPROXY).
+Ansible-проект для развёртывания Telegram MTProxy с балансировкой через HAProxy и прозрачным проксированием (TPROXY) — клиентский IP сохраняется на бэкенде. Два VPS соединены WireGuard-туннелем.
 
 ---
 
-## Тестовый стенд (развёрнуто и проверено)
+## Тестовый стенд
 
-Проект развёрнут на тестовом VPS и доступен для проверки:
-
-| Ресурс | Ссылка / адрес |
+| Ресурс | Адрес |
 |---|---|
-| **Подключение через Telegram** | `tg://proxy?server=206.245.131.154&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3` |
-| **То же, через браузер** | [https://t.me/proxy?server=206.245.131.154&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3](https://t.me/proxy?server=206.245.131.154&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3) |
-| **HAProxy Stats Dashboard** | [http://206.245.131.154:8404/stats](http://206.245.131.154:8404/stats) (логин: `admin`, пароль: `Ch4ng3M3!`) |
+| **Proxy (Telegram)** | `tg://proxy?server=5.10.213.161&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3` |
+| **Proxy (браузер)** | [t.me/proxy?server=5.10.213.161&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3](https://t.me/proxy?server=5.10.213.161&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3) |
+| **HAProxy Stats** | [http://5.10.213.161:8404/stats](http://5.10.213.161:8404/stats) — `admin` / `Ch4ng3M3!` |
+| **MTProxy Dashboard** | [http://206.245.131.154:8080](http://206.245.131.154:8080) — `admin` / `Ch4ng3M3!` |
 
-**Конфигурация тестового стенда:**
-
-- **VPS**: `206.245.131.154`, Debian 11 (bullseye), 2 vCPU / 2 GB RAM
-- **mtproxy_1**: порт `4431` — UP
-- **mtproxy_2**: порт `4432` — UP
-- **HAProxy**: порт `8443` (вход), `8404` (stats), алгоритм `leastconn`
-- **Failover проверен**: `docker stop mtproxy_2` — HAProxy определяет DOWN за ~6 сек, трафик автоматически идёт на `mtproxy_1`. После `docker start mtproxy_2` — возврат в UP за ~4 сек.
+| Хост | Роль | IP | WireGuard |
+|---|---|---|---|
+| Балансер | HAProxy + TPROXY | `5.10.213.161` | `10.8.0.1` |
+| Бэкенд | MTProxy ×2 | `206.245.131.154` | `10.8.0.2` |
 
 ---
 
 ## Архитектура
 
 ```
-                     ┌──────────────────────────────────────────────┐
-                     │              Единая ВМ (--network host)      │
-                     │                                              │
- Telegram-клиент ──► │  HAProxy :8443                               │
- (реальный IP        │    ├─► mtproxy_1 :4431 ──► Telegram Servers  │
-  сохраняется)       │    └─► mtproxy_2 :4432 ──► Telegram Servers  │
-                     │                                              │
-                     │  Stats dashboard :8404/stats                 │
-                     └──────────────────────────────────────────────┘
+ Telegram        ┌──────────────────────────────────┐
+ клиент          │  Балансер  5.10.213.161           │
+   │             │                                   │
+   └──► :8443 ──►│  HAProxy (source 0.0.0.0          │
+                 │           usesrc clientip)         │
+                 │       │                           │
+                 │       │  wg0  10.8.0.1            │
+                 └───────┼───────────────────────────┘
+                         │  WireGuard  UDP :51820
+                         ▼
+                 ┌───────────────────────────────────┐
+                 │  Бэкенд  206.245.131.154          │
+                 │                                   │
+                 │       wg0  10.8.0.2               │
+                 │       │                           │
+                 │       ├──► mtproxy_1  :4431       │
+                 │       └──► mtproxy_2  :4432       │
+                 │                 │                  │
+                 │  iptables mark + ip rule fwmark 1 │
+                 │  → ответы уходят обратно через wg0│
+                 └───────────────────────────────────┘
+                                   │
+                                   ▼
+                            Telegram DC
 ```
 
-- **HAProxy** принимает TCP-подключения на порту 8443 и балансирует их между MTProxy-инстансами по алгоритму `leastconn`.
-- **Failover**: если один из бэкендов недоступен (health check: TCP connect каждые 3 сек, 2 неудачи = DOWN), трафик автоматически переключается на оставшийся.
+### Поток TPROXY
 
-## Transparent Mode (TPROXY) — анализ и реализация
+1. Клиент → HAProxy `5.10.213.161:8443`
+2. HAProxy открывает TCP к `10.8.0.2:4431` с **source IP = IP клиента** (`usesrc clientip`)
+3. Пакет уходит через WireGuard — внешне от IP балансера, внутри туннеля source IP подменён
+4. MTProxy на бэкенде видит реальный IP клиента
+5. Ответ от MTProxy помечается `iptables -t mangle -A OUTPUT --sport 4431 -j MARK --set-mark 1`
+6. `ip rule fwmark 1 lookup 100` → `default dev wg0 table 100` — ответ идёт обратно через WireGuard
+7. На балансере `iptables -t mangle PREROUTING -i wg0 --sport 4431 -j MARK --set-mark 1` → `local 0.0.0.0/0 dev lo table 100` доставляет пакет в TPROXY-сокет HAProxy
+8. HAProxy отдаёт ответ клиенту
 
-### Рассмотренные варианты
+### Зачем WireGuard?
 
-| Вариант | Подходит? | Почему |
-|---|---|---|
-| **PROXY Protocol** | Нет | `telegrammessenger/proxy` не поддерживает PROXY Protocol |
-| **DSR (Direct Server Return)** | Нет | HAProxy — полноценный TCP-прокси, ответ должен идти обратно через него |
-| **TPROXY (`IP_TRANSPARENT`)** | **Условно** | Спуфинг source IP на уровне ядра Linux; работает с любым TCP-приложением, но **требует разные сетевые сегменты** |
+Без туннеля TPROXY между двумя VPS не работает:
 
-### Реализация
+- **BCP38** — провайдер дропает исходящие пакеты с чужим source IP
+- **Асимметричный маршрут** — ответ от MTProxy уходит напрямую клиенту, минуя HAProxy, и соединение ломается
 
-Проект поддерживает **TPROXY** (`source 0.0.0.0 usesrc clientip`) — спуфинг source IP на уровне ядра Linux, что позволяет MTProxy видеть реальный IP клиента. Функция управляется переменной `haproxy_tproxy`.
+WireGuard решает обе проблемы: снаружи пакет идёт с реальным IP сервера, а внутри туннеля source IP может быть любым.
 
-**Ограничение single-host:** на одном хосте HAProxy и MTProxy общаются через loopback (`127.0.0.1`). Ядро Linux отбрасывает пакеты с нелокальным source IP на lo-интерфейсе — SYN с клиентским IP до MTProxy не доходит. Поэтому для single-host развёртывания TPROXY отключён (`haproxy_tproxy: false`).
+### NAT info (`--nat-info`)
 
-**Для multi-host** (HAProxy и MTProxy на разных серверах или в разных network namespace): установить `haproxy_tproxy: true`. В этом случае пакеты идут через физический интерфейс, и TPROXY работает корректно.
+MTProxy требует параметр `--nat-info LOCAL_IP:GLOBAL_IP` для корректной работы Telegram-протокола. В схеме с WireGuard:
 
-Инфраструктура TPROXY (sysctl, ip rule/route, iptables mangle, capabilities) деплоится всегда и готова к включению.
+- `LOCAL_IP` = `10.8.0.2` — адрес, на котором MTProxy принимает соединения (WireGuard-интерфейс)
+- `GLOBAL_IP` = `5.10.213.161` — публичный адрес, по которому подключаются клиенты (IP балансера)
 
-Все контейнеры работают с `--network host` для единого сетевого пространства, исключающего конфликты Docker NAT.
+Это настраивается через переменные `mtproxy_nat_internal_ip` и `mtproxy_nat_external_ip`. Кастомный `run.sh` передаёт их в MTProxy вместо автоопределения.
+
+---
 
 ## Требования
 
-- **ВМ**: 1 vCPU / 1 GB RAM (минимум), 2 vCPU / 2 GB RAM (рекомендовано)
-- **ОС**: Debian 11+ / Ubuntu 22.04+ (протестировано на Debian 11 bullseye)
-- **Ansible**: >= 2.14 на управляющей машине
-- **SSH-доступ** к целевому хосту с правами `sudo`
+- **2 VPS** с публичными IP (Debian 11+ / Ubuntu 22.04+)
+- **Ansible** >= 2.14 на управляющей машине
+- **sshpass** — если используется аутентификация по паролю
+- Открытые порты:
+  - **TCP 8443** на балансере (вход для клиентов)
+  - **UDP 51820** между серверами (WireGuard)
+
+---
 
 ## Быстрый старт
 
-### 1. Установить зависимости Ansible
+### 1. Установить зависимости
 
 ```bash
 ansible-galaxy collection install -r requirements.yml
+sudo apt install -y sshpass  # если используется ansible_password
 ```
 
 ### 2. Настроить inventory
 
-Через переменные окружения (рекомендуется):
-
-```bash
-export MTPROXY_HOST=203.0.113.10
-export MTPROXY_USER=root
-```
-
-Или отредактировать `inventory/hosts.yml` напрямую — указать IP и пользователя целевой ВМ.
-
-> **Безопасность**: Не храните пароли в открытом виде в inventory. Используйте SSH-ключи или `--ask-pass` / `ansible-vault`.
-
-### 3. Сгенерировать секрет MTProxy
-
-```bash
-# Генерация 32 hex символов (16 байт)
-openssl rand -hex 16
-```
-
-Вставить полученный секрет в `inventory/group_vars/all.yml`:
+`inventory/hosts.yml`:
 
 ```yaml
-mtproxy_secret: "<32_hex_символа>"
+all:
+  vars:
+    ansible_user: root
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+  children:
+    balancers:
+      hosts:
+        balancer:
+          ansible_host: <IP_БАЛАНСЕРА>
+          ansible_password: <ПАРОЛЬ>
+          wireguard_address: "10.8.0.1/24"
+    backends:
+      hosts:
+        backend:
+          ansible_host: <IP_БЭКЕНДА>
+          ansible_password: <ПАРОЛЬ>
+          wireguard_address: "10.8.0.2/24"
 ```
 
-> Образ `telegrammessenger/proxy` сам добавляет `dd`-префикс (fake-TLS) при генерации ссылок.
+> Для продакшена замените `ansible_password` на SSH-ключи или используйте `ansible-vault`.
+
+### 3. Настроить переменные
+
+`inventory/group_vars/all.yml`:
+
+```yaml
+mtproxy_secret: "<openssl rand -hex 16>"
+mtproxy_nat_internal_ip: "10.8.0.2"        # WireGuard IP бэкенда
+mtproxy_nat_external_ip: "<IP_БАЛАНСЕРА>"   # публичный IP, по которому клиенты подключаются
+```
 
 ### 4. Запустить playbook
 
@@ -112,80 +142,77 @@ mtproxy_secret: "<32_hex_символа>"
 ansible-playbook -i inventory/hosts.yml playbooks/site.yml
 ```
 
-Для подключения по паролю:
+### 5. Подключиться через Telegram
+
+```
+tg://proxy?server=<IP_БАЛАНСЕРА>&port=8443&secret=dd<ваш_секрет>
+```
+
+Префикс `dd` перед секретом включает fake-TLS (рекомендуется).
+
+---
+
+## Проверка работы
+
+### HAProxy Stats Dashboard
+
+```
+http://<IP_БАЛАНСЕРА>:8404/stats
+```
+
+Оба бэкенда `mtproxy_1` и `mtproxy_2` должны быть **UP** (зелёные).
+
+### WireGuard туннель
 
 ```bash
-ansible-playbook -i inventory/hosts.yml playbooks/site.yml --ask-pass
+# На любом хосте
+wg show
+ping -c 3 10.8.0.2   # с балансера
+ping -c 3 10.8.0.1   # с бэкенда
 ```
 
-### 5. Получить ссылку для Telegram
+### MTProxy Dashboard — реальные IP клиентов
+
+Веб-панель на бэкенде показывает активные клиентские соединения в реальном времени:
 
 ```
-tg://proxy?server=<IP_ВМ>&port=8443&secret=<ваш_секрет>
+http://<IP_БЭКЕНДА>:8080
 ```
 
-Или в формате HTTPS:
+Таблица соединений содержит:
 
-```
-https://t.me/proxy?server=<IP_ВМ>&port=8443&secret=<ваш_секрет>
-```
+| Колонка | Описание |
+|---------|----------|
+| **Клиентский IP (белый)** | Реальный публичный IP клиента Telegram |
+| **Клиентский порт** | Исходный порт клиента |
+| **IP туннеля (WireGuard)** | IP интерфейса wg0, на котором MTProxy принял соединение |
+| **Порт MTProxy** | Порт инстанса (4431, 4432, ...) с именем контейнера |
 
-## Проверка Failover
+Также отображаются: статистика (активные соединения, уникальные клиенты), статус Docker-контейнеров и WireGuard.
 
-> Ниже — инструкция на примере тестового стенда (`206.245.131.154`). Для своего сервера замените IP.
+Страница обновляется автоматически каждые 5 секунд. Доступен JSON API: `GET /api/connections`.
 
-### Шаг 1. Убедиться, что оба бэкенда работают
-
-Открыть HAProxy Stats Dashboard в браузере:
-
-```
-http://206.245.131.154:8404/stats
-```
-
-> Логин: `admin`, пароль: `Ch4ng3M3!`
-
-Оба сервера `mtproxy_1` и `mtproxy_2` должны быть в статусе **UP** (зелёные).
-
-Или через curl:
+### TPROXY — проверка через CLI
 
 ```bash
-curl -s -u admin:Ch4ng3M3! http://206.245.131.154:8404/stats | grep -oP 'mtproxy_\d.*?(UP|DOWN)'
+# На бэкенде
+conntrack -L -p tcp --dport 4431 2>/dev/null | head
+ss -tn state established '( sport = :4431 or sport = :4432 )'
 ```
 
-### Шаг 2. Подключиться через Telegram
+В `src=` должны быть реальные клиентские IP, а не `10.8.0.1`.
 
-Добавить прокси по ссылке (для тестового стенда):
-
-```
-tg://proxy?server=206.245.131.154&port=8443&secret=ddb3b34e89c9471207ad107a03b565e9a3
-```
-
-> Обратите внимание на `dd`-префикс в секрете — он обязателен для fake-TLS режима.
-
-Убедиться, что подключение работает (статус: "Connected").
-
-### Шаг 3. Остановить один инстанс
+### Failover
 
 ```bash
-ssh root@206.245.131.154
+ssh root@<IP_БЭКЕНДА>
 docker stop mtproxy_2
-```
-
-### Шаг 4. Проверить failover
-
-1. **Stats Dashboard** (`http://206.245.131.154:8404/stats`):
-   - `mtproxy_1` — **UP** (зелёный)
-   - `mtproxy_2` — **DOWN** (красный, определяется за ~6 сек)
-
-2. **Telegram**: подключение **продолжает работать** — трафик автоматически идёт через `mtproxy_1`.
-
-### Шаг 5. Вернуть инстанс в строй
-
-```bash
+# Stats Dashboard: mtproxy_2 → DOWN (~6 сек), трафик идёт через mtproxy_1
 docker start mtproxy_2
+# mtproxy_2 → UP (~6 сек)
 ```
 
-Через ~6 секунд (2 успешных health check, `inter 3s rise 2`) `mtproxy_2` вернётся в статус **UP** и начнёт принимать новые подключения.
+---
 
 ## Масштабирование
 
@@ -195,84 +222,145 @@ docker start mtproxy_2
 mtproxy_replicas: 4
 ```
 
-Перезапустить playbook:
+Перезапустить playbook — Ansible создаст новые контейнеры и обновит конфиг HAProxy. Контейнеры с индексом выше `mtproxy_replicas` удаляются автоматически (scale-down до `mtproxy_max_cleanup_index`).
+
+---
+
+## Персистентность
+
+Все настройки переживают перезагрузку:
+
+| Компонент | Механизм |
+|---|---|
+| sysctl | `/etc/sysctl.d/` — применяется при загрузке |
+| ip rule / ip route | `tproxy-routing.service` (systemd oneshot) |
+| iptables | `iptables-persistent` → `/etc/iptables/rules.v4` |
+| WireGuard | `wg-quick@wg0.service` (systemd) |
+| Docker-контейнеры | `restart_policy: unless-stopped` |
+| MTProxy Dashboard | `mtproxy-dashboard.service` (systemd) |
+
+---
+
+## Ротация конфигурации
+
+При изменении переменных:
 
 ```bash
 ansible-playbook -i inventory/hosts.yml playbooks/site.yml
 ```
 
-Ansible автоматически:
-- Создаст новые контейнеры `mtproxy_3`, `mtproxy_4` на портах 4433, 4434.
-- Обновит конфиг HAProxy (добавит новые бэкенды в шаблон).
-- Выполнит graceful reload HAProxy без разрыва существующих соединений.
+HAProxy выполнит graceful reload (`SIGUSR2`) без разрыва существующих соединений.
 
-При уменьшении `mtproxy_replicas` лишние контейнеры будут остановлены и удалены.
-
-## Ротация конфигов HAProxy
-
-При изменении любых переменных в `group_vars/all.yml` (алгоритм балансировки, порты, количество реплик):
-
-```bash
-ansible-playbook -i inventory/hosts.yml playbooks/site.yml
-```
-
-Порядок действий (автоматически):
-1. Шаблон `haproxy.cfg.j2` рендерится с новыми значениями.
-2. Если конфиг изменился — срабатывает handler `Reload HAProxy`.
-3. Handler валидирует конфиг внутри контейнера (`haproxy -c -f ...`).
-4. При успешной валидации — отправляет `SIGUSR2` (graceful reload в master-worker mode).
-5. Новые воркеры стартуют с обновлённым конфигом, старые дослуживают соединения.
-
-## Персистентность сетевых правил
-
-Правила TPROXY сохраняются между перезагрузками:
-
-- **sysctl** — записываются в `/etc/sysctl.d/`, применяются автоматически при загрузке.
-- **ip rule / ip route** — `tproxy-routing.service` (systemd oneshot) восстанавливает правила маршрутизации после ребута.
-- **iptables** — правила сохраняются через `iptables-persistent` (`/etc/iptables/rules.v4`).
+---
 
 ## Структура проекта
 
 ```
 testovoe_zadanie/
-├── ansible.cfg                    # конфигурация Ansible
-├── requirements.yml               # зависимости (community.docker, ansible.posix)
+├── ansible.cfg                        # настройки Ansible
+├── requirements.yml                   # зависимости (community.docker, ansible.posix)
 ├── inventory/
-│   ├── hosts.yml                  # целевые хосты (через env vars)
+│   ├── hosts.yml                      # хосты: балансер + бэкенд
 │   └── group_vars/
-│       └── all.yml                # все переменные (реплики, секрет, порты)
+│       └── all.yml                    # все переменные проекта
 ├── playbooks/
-│   └── site.yml                   # главный playbook
-├── roles/
-│   ├── docker/
-│   │   └── tasks/main.yml         # установка Docker CE + Python SDK
-│   ├── mtproxy/
-│   │   ├── defaults/main.yml      # переменные по умолчанию
-│   │   ├── tasks/main.yml         # создание N контейнеров + scale-down
-│   │   ├── templates/
-│   │   │   └── run.sh.j2          # кастомный run.sh (поддержка PORT env)
-│   │   └── handlers/main.yml      # рестарт контейнеров
-│   └── haproxy/
-│       ├── defaults/main.yml      # переменные HAProxy
-│       ├── tasks/main.yml         # TPROXY-настройка, персистентность, деплой
-│       ├── templates/
-│       │   └── haproxy.cfg.j2     # Jinja2-шаблон с динамическим backend
-│       └── handlers/main.yml      # валидация + graceful reload (SIGUSR2)
-└── README.md
+│   └── site.yml                       # главный playbook (3 play)
+└── roles/
+    ├── wireguard/
+    │   ├── defaults/main.yml
+    │   ├── tasks/main.yml             # установка, генерация ключей, обмен
+    │   ├── templates/wg0.conf.j2      # конфиг с автообменом ключей между хостами
+    │   └── handlers/main.yml
+    ├── docker/
+    │   └── tasks/main.yml             # установка Docker CE + Python SDK
+    ├── mtproxy/
+    │   ├── defaults/main.yml
+    │   ├── tasks/main.yml             # создание N контейнеров + scale-down
+    │   ├── templates/run.sh.j2        # кастомный entrypoint с поддержкой NAT_*_IP
+    │   └── handlers/main.yml
+    ├── tproxy_backend/
+    │   ├── tasks/main.yml             # rp_filter, iptables mark, route via wg0
+    │   └── handlers/main.yml
+    ├── haproxy/
+    │   ├── defaults/main.yml
+    │   ├── tasks/main.yml             # sysctl, TPROXY routing, iptables, контейнер
+    │   ├── templates/haproxy.cfg.j2   # конфиг с usesrc clientip
+    │   └── handlers/main.yml
+    └── mtproxy_dashboard/
+        ├── defaults/main.yml
+        ├── tasks/main.yml             # деплой веб-панели + systemd
+        ├── templates/dashboard.py.j2  # Python HTTP-сервер (без зависимостей)
+        └── handlers/main.yml
 ```
+
+---
 
 ## Переменные
 
+### MTProxy
+
 | Переменная | Умолчание | Описание |
 |---|---|---|
-| `mtproxy_replicas` | `2` | Количество MTProxy инстансов |
+| `mtproxy_replicas` | `2` | Количество инстансов MTProxy |
 | `mtproxy_secret` | `000...` | Секрет прокси (32 hex символа) |
-| `mtproxy_image` | `telegrammessenger/proxy:latest` | Docker-образ MTProxy |
+| `mtproxy_image` | `telegrammessenger/proxy:latest` | Docker-образ |
 | `mtproxy_base_port` | `4431` | Базовый порт (инстансы: 4431, 4432, ...) |
-| `haproxy_image` | `haproxy:2.9-alpine` | Docker-образ HAProxy |
+| `mtproxy_max_cleanup_index` | `10` | Верхний индекс для scale-down очистки |
+| `mtproxy_nat_internal_ip` | — | IP, на котором MTProxy принимает соединения (WireGuard) |
+| `mtproxy_nat_external_ip` | — | Публичный IP для клиентов (IP балансера) |
+
+### HAProxy
+
+| Переменная | Умолчание | Описание |
+|---|---|---|
+| `haproxy_image` | `haproxy:2.9-alpine` | Docker-образ |
 | `haproxy_frontend_port` | `8443` | Порт входа для клиентов |
-| `haproxy_stats_port` | `8404` | Порт HAProxy Stats Dashboard |
-| `haproxy_stats_user` | `admin` | Логин для Stats Dashboard |
-| `haproxy_stats_password` | `Ch4ng3M3!` | Пароль для Stats Dashboard |
-| `haproxy_balance` | `leastconn` | Алгоритм балансировки (leastconn / roundrobin) |
-| `haproxy_tproxy` | `false` | Включить TPROXY (usesrc clientip) — только для multi-host |
+| `haproxy_stats_port` | `8404` | Порт Stats Dashboard |
+| `haproxy_stats_user` | `admin` | Логин Stats Dashboard |
+| `haproxy_stats_password` | `Ch4ng3M3!` | Пароль Stats Dashboard |
+| `haproxy_balance` | `leastconn` | Алгоритм балансировки |
+| `haproxy_tproxy` | `false` | TPROXY (`usesrc clientip`) |
+| `mtproxy_backend_ip` | `127.0.0.1` | IP бэкенда для HAProxy (WireGuard IP при multi-host) |
+
+### MTProxy Dashboard
+
+| Переменная | Умолчание | Описание |
+|---|---|---|
+| `dashboard_port` | `8080` | Порт веб-панели |
+| `dashboard_user` | `admin` | Логин Basic Auth |
+| `dashboard_password` | `Ch4ng3M3!` | Пароль Basic Auth |
+
+### WireGuard
+
+| Переменная | Умолчание | Описание |
+|---|---|---|
+| `wireguard_listen_port` | `51820` | UDP-порт WireGuard |
+| `wireguard_address` | per-host | WireGuard IP (`10.8.0.x/24`) |
+
+---
+
+## Роли
+
+### `wireguard`
+
+Устанавливает WireGuard, генерирует ключи на каждом хосте, автоматически обменивается публичными ключами через Ansible facts и разворачивает `wg0.conf`. На бэкенде `Table = off` — маршруты управляются вручную через policy routing.
+
+### `docker`
+
+Устанавливает Docker CE и Python Docker SDK (`python3-docker`) — необходим для модуля `community.docker`.
+
+### `mtproxy`
+
+Разворачивает N контейнеров MTProxy в `--network host` режиме. Каждый инстанс получает свой порт (`mtproxy_base_port + i`). Кастомный `run.sh` принимает `NAT_INTERNAL_IP` / `NAT_EXTERNAL_IP` через env-переменные — без них MTProxy автоопределяет IP и ломается в WireGuard-сетапе. Поддерживает scale-down — лишние контейнеры удаляются.
+
+### `tproxy_backend`
+
+Настраивает return-path маршрутизацию на бэкенде: отключает `rp_filter`, создаёт policy route (`fwmark 1 → table 100 → default dev wg0`), помечает ответы MTProxy через `iptables mangle OUTPUT`. Systemd-сервис обеспечивает персистентность.
+
+### `haproxy`
+
+Настраивает TPROXY на стороне балансера: `ip_nonlocal_bind`, policy routing для return-трафика, `iptables mangle PREROUTING -i wg0`. Рендерит `haproxy.cfg` из шаблона и запускает контейнер с `NET_ADMIN` + `NET_RAW` capabilities. Graceful reload через `SIGUSR2`.
+
+### `mtproxy_dashboard`
+
+Разворачивает веб-панель мониторинга активных клиентских соединений на бэкенде. Чистый Python 3 без внешних зависимостей. Показывает таблицу соединений (реальный IP клиента, порт, IP туннеля, порт MTProxy), статус Docker-контейнеров и WireGuard. Авто-обновление каждые 5 секунд, Basic Auth, JSON API (`/api/connections`). Работает как systemd-сервис.

@@ -1,0 +1,52 @@
+---
+# ============================================================
+#  Роль: wireguard — установка, генерация ключей, настройка
+#  туннеля между балансером и бэкендами
+# ============================================================
+
+- name: Install WireGuard
+  ansible.builtin.apt:
+    name:
+      - wireguard
+      - wireguard-tools
+    state: present
+    update_cache: true
+
+- name: Ensure WireGuard config directory permissions
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    mode: "0700"
+
+- name: Generate WireGuard private key
+  ansible.builtin.shell: umask 077 && wg genkey > /etc/wireguard/private.key
+  args:
+    creates: /etc/wireguard/private.key
+
+- name: Read WireGuard private key
+  ansible.builtin.slurp:
+    src: /etc/wireguard/private.key
+  register: _wg_private_key_raw
+
+- name: Derive WireGuard public key
+  ansible.builtin.shell: cat /etc/wireguard/private.key | wg pubkey
+  register: _wg_pubkey
+  changed_when: false
+
+- name: Store WireGuard keys as host facts
+  ansible.builtin.set_fact:
+    wireguard_private_key: "{{ _wg_private_key_raw.content | b64decode | trim }}"
+    wireguard_public_key: "{{ _wg_pubkey.stdout | trim }}"
+
+- name: Deploy WireGuard configuration
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    mode: "0600"
+  notify: Restart WireGuard
+
+- name: Enable and start WireGuard
+  ansible.builtin.systemd:
+    name: wg-quick@wg0
+    enabled: true
+    state: started

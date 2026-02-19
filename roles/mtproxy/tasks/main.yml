@@ -33,6 +33,8 @@
       PORT: "{{ (mtproxy_base_port + item - 1) | string }}"
       STATS_PORT: "{{ (2398 + item - 1) | string }}"
       WORKERS: "2"
+      NAT_INTERNAL_IP: "{{ mtproxy_nat_internal_ip | default(omit) }}"
+      NAT_EXTERNAL_IP: "{{ mtproxy_nat_external_ip | default(omit) }}"
     volumes:
       - "mtproxy_data_{{ item }}:/data"
       - "/opt/mtproxy/run.sh:/run.sh:ro"

@@ -63,8 +63,17 @@ curl -s https://core.telegram.org/getProxyConfig -o /etc/telegram/backend.conf |
 }
 CONFIG=/etc/telegram/backend.conf
 
-IP="$(curl -s -4 "https://digitalresistance.dog/myIp")"
-INTERNAL_IP="$(ip -4 route get 8.8.8.8 | grep '^8\.8\.8\.8\s' | grep -Po 'src\s+\d+\.\d+\.\d+\.\d+' | awk '{print $2}')"
+if [ -z "$NAT_EXTERNAL_IP" ]; then
+  IP="$(curl -s -4 "https://digitalresistance.dog/myIp")"
+else
+  IP="$NAT_EXTERNAL_IP"
+fi
+
+if [ -z "$NAT_INTERNAL_IP" ]; then
+  INTERNAL_IP="$(ip -4 route get 8.8.8.8 | grep '^8\.8\.8\.8\s' | grep -Po 'src\s+\d+\.\d+\.\d+\.\d+' | awk '{print $2}')"
+else
+  INTERNAL_IP="$NAT_INTERNAL_IP"
+fi
 
 if [[ -z "$IP" ]]; then
   echo "[F] Cannot determine external IP address."

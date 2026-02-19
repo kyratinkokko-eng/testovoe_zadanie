@@ -1,0 +1,27 @@
+# WireGuard tunnel for TPROXY — managed by Ansible
+[Interface]
+PrivateKey = {{ wireguard_private_key }}
+Address = {{ wireguard_address }}
+ListenPort = {{ wireguard_listen_port }}
+{% if 'backends' in group_names %}
+Table = off
+{% endif %}
+
+{% if 'balancers' in group_names %}
+{% for host in groups['backends'] %}
+[Peer]
+PublicKey = {{ hostvars[host].wireguard_public_key }}
+AllowedIPs = {{ hostvars[host].wireguard_address.split('/')[0] }}/32
+Endpoint = {{ hostvars[host].ansible_host }}:{{ hostvars[host].wireguard_listen_port | default(wireguard_listen_port) }}
+PersistentKeepalive = 25
+{% endfor %}
+{% endif %}
+{% if 'backends' in group_names %}
+{% for host in groups['balancers'] %}
+[Peer]
+PublicKey = {{ hostvars[host].wireguard_public_key }}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {{ hostvars[host].ansible_host }}:{{ hostvars[host].wireguard_listen_port | default(wireguard_listen_port) }}
+PersistentKeepalive = 25
+{% endfor %}
+{% endif %}

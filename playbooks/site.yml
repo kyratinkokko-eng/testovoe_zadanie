@@ -1,19 +1,20 @@
 ---
 # ============================================================
-#  Active-Active MTProxy с HAProxy балансировкой и failover
+#  Multi-host MTProxy с TPROXY через WireGuard туннель
+#
+#  Архитектура:
+#    Client → HAProxy (balancer, TPROXY) → WireGuard → MTProxy (backend)
 #
 #  Использование:
 #    ansible-galaxy collection install -r requirements.yml
 #    ansible-playbook -i inventory/hosts.yml playbooks/site.yml
-#
-#  Масштабирование:
-#    Изменить mtproxy_replicas в inventory/group_vars/all.yml
-#    и перезапустить playbook — HAProxy конфиг обновится
-#    автоматически с graceful reload.
 # ============================================================
 
-- name: Deploy MTProxy Active-Active with HAProxy (TPROXY)
-  hosts: mtproxy_servers
+# -----------------------------------------------------------
+#  Play 1: WireGuard туннель между балансером и бэкендами
+# -----------------------------------------------------------
+- name: Setup WireGuard tunnel
+  hosts: all
   become: true
 
   pre_tasks:
@@ -32,6 +33,34 @@
       ignore_errors: true
 
   roles:
+    - wireguard
+
+# -----------------------------------------------------------
+#  Play 2: MTProxy бэкенды + TPROXY return routing
+# -----------------------------------------------------------
+- name: Deploy MTProxy backends
+  hosts: backends
+  become: true
+
+  roles:
     - docker
     - mtproxy
+    - tproxy_backend
+    - mtproxy_dashboard
+
+  tasks:
+    - name: Stop old HAProxy container (moved to balancer)
+      community.docker.docker_container:
+        name: haproxy
+        state: absent
+
+# -----------------------------------------------------------
+#  Play 3: HAProxy балансер с TPROXY
+# -----------------------------------------------------------
+- name: Deploy HAProxy balancer with TPROXY
+  hosts: balancers
+  become: true
+
+  roles:
+    - docker
     - haproxy

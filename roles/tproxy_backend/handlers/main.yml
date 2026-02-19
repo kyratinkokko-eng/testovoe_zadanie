@@ -1,0 +1,7 @@
+---
+- name: Enable tproxy-backend-routing service
+  ansible.builtin.systemd:
+    name: tproxy-routing
+    enabled: true
+    daemon_reload: true
+    state: started

@@ -1,6 +1,6 @@
 ---
 # ============================================================
-#  Роль: haproxy — TPROXY-настройка хоста, деплой конфига,
+#  Роль: haproxy — TPROXY-настройка балансера, деплой конфига,
 #  запуск контейнера HAProxy в master-worker режиме
 # ============================================================
 
@@ -25,7 +25,9 @@
     reload: true
 
 # -----------------------------------------------------------
-#  2. TPROXY: ip rule + ip route (runtime)
+#  2. TPROXY: ip rule + ip route
+#     Пакеты с fwmark 1 обрабатываются как local —
+#     ядро доставляет их в TPROXY-сокет HAProxy
 # -----------------------------------------------------------
 - name: "TPROXY: clean up duplicate ip rules"
   ansible.builtin.shell: |
@@ -48,7 +50,6 @@
 
 # -----------------------------------------------------------
 #  2b. Персистентность ip rule / ip route после ребута
-#      через systemd oneshot unit
 # -----------------------------------------------------------
 - name: "TPROXY: deploy systemd unit for persistent routing"
   ansible.builtin.copy:
@@ -73,17 +74,20 @@
   notify: Enable tproxy-routing service
 
 # -----------------------------------------------------------
-#  3. TPROXY: iptables mangle rules (runtime, idempotent)
+#  3. TPROXY iptables: PREROUTING на wg0 для return-трафика
+#     Ответы от MTProxy приходят через WireGuard с sport=443x
+#     → помечаются → policy routing доставляет в TPROXY-сокет
 # -----------------------------------------------------------
-- name: "TPROXY: mark return traffic from MTProxy ports (iptables mangle OUTPUT)"
+- name: "TPROXY: mark return traffic on WireGuard (PREROUTING)"
   ansible.builtin.shell: |
-    iptables -t mangle -C OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1 2>/dev/null \
-    || iptables -t mangle -A OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1
+    iptables -t mangle -C PREROUTING -i wg0 -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1 2>/dev/null \
+    || iptables -t mangle -A PREROUTING -i wg0 -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1
   loop: "{{ range(1, mtproxy_replicas + 1) | list }}"
   loop_control:
     label: "port {{ mtproxy_base_port + item - 1 }}"
   register: iptables_result
   changed_when: "'already' not in iptables_result.stderr"
+  when: haproxy_tproxy | bool
 
 # -----------------------------------------------------------
 #  3b. Персистентность iptables через iptables-persistent

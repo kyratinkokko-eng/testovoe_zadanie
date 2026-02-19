@@ -1,0 +1,87 @@
+---
+# ============================================================
+#  TPROXY return-path routing на бэкенде:
+#  ответы MTProxy с spoofed client IP маршрутизируются
+#  обратно через WireGuard туннель к балансеру
+# ============================================================
+
+# rp_filter отбрасывает пакеты с нелокальным source IP;
+# TPROXY спуфит client IP → нужно отключить
+- name: "Sysctl: disable rp_filter for TPROXY spoofed packets"
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop:
+    - { key: "net.ipv4.conf.all.rp_filter", value: "0" }
+    - { key: "net.ipv4.conf.default.rp_filter", value: "0" }
+    - { key: "net.ipv4.conf.wg0.rp_filter", value: "0" }
+
+- name: "TPROXY backend: clean up duplicate ip rules"
+  ansible.builtin.shell: |
+    while ip rule del fwmark 1 lookup 100 2>/dev/null; do :; done
+  changed_when: false
+
+- name: "TPROXY backend: add ip rule fwmark 1 lookup 100"
+  ansible.builtin.command:
+    cmd: ip rule add fwmark 1 lookup 100
+  register: ip_rule_result
+  changed_when: ip_rule_result.rc == 0
+  failed_when: ip_rule_result.rc != 0 and 'File exists' not in ip_rule_result.stderr
+
+- name: "TPROXY backend: flush routing table 100"
+  ansible.builtin.shell: ip route flush table 100 2>/dev/null || true
+  changed_when: false
+
+- name: "TPROXY backend: default route via WireGuard in table 100"
+  ansible.builtin.command:
+    cmd: ip route add default dev wg0 table 100
+  register: ip_route_result
+  changed_when: ip_route_result.rc == 0
+  failed_when: ip_route_result.rc != 0 and 'File exists' not in ip_route_result.stderr
+
+- name: "TPROXY backend: deploy systemd unit for persistent routing"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tproxy-routing.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=TPROXY return-path routing via WireGuard
+      After=network-online.target wg-quick@wg0.service
+      Wants=network-online.target
+      Requires=wg-quick@wg0.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/sh -c '/sbin/ip rule add fwmark 1 lookup 100 2>/dev/null || true'
+      ExecStart=/bin/sh -c '/sbin/ip route add default dev wg0 table 100 2>/dev/null || true'
+      ExecStop=/sbin/ip rule del fwmark 1 lookup 100
+      ExecStop=/sbin/ip route del default dev wg0 table 100
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Enable tproxy-backend-routing service
+
+- name: "TPROXY backend: mark return traffic from MTProxy ports"
+  ansible.builtin.shell: |
+    iptables -t mangle -C OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -p tcp --sport {{ mtproxy_base_port + item - 1 }} -j MARK --set-mark 0x1/0x1
+  loop: "{{ range(1, mtproxy_replicas + 1) | list }}"
+  loop_control:
+    label: "port {{ mtproxy_base_port + item - 1 }}"
+  register: iptables_result
+  changed_when: "'already' not in iptables_result.stderr"
+
+- name: Install iptables-persistent
+  ansible.builtin.apt:
+    name: iptables-persistent
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Save iptables rules for persistence
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: true
